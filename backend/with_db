@@ -1,0 +1,100 @@
+const express = require('express');
+const router = express.Router();
+const speakeasy = require('speakeasy');
+const qrcode = require('qrcode');
+const db = require('../../_helpers/db');
+
+async function getUserByEmail(email) {
+    try {
+        const user = await db.User.findOne({ where: { email: email } });
+        return user;
+    } catch (error) {
+        console.error('Error retrieving user from the database:', error);
+        throw error;
+    }
+}
+
+router.post('/register', async (req, res) => {
+    const email = req.body.email;
+    const issuer = "LifeTime Lotto Game";
+    if (!email) {
+        return res.status(400).send('Email is required.');
+    }
+
+    const secret = speakeasy.generateSecret({ length: 20 });
+    const userSecretKey = secret.base32;
+
+    const otpauth_url = speakeasy.otpauthURL({
+        secret: userSecretKey,
+        label: email,
+        issuer: issuer,
+    });
+
+    qrcode.toDataURL(otpauth_url, async (err, data_url) => {
+        if (err) {
+            console.error('Error generating QR code:', err);
+            res.status(500).send('Error generating QR code');
+        } else {
+            try {
+                const user = await getUserByEmail(email);
+                if (!user) {
+                    return res.status(404).send('User not found');
+                }
+                user.twofa_data = JSON.stringify({
+                    userSecretKey,
+                    email,
+                    data_url,
+                    issuer,
+                });
+                await user.save();
+                res.send({ userSecretKey, issuer, email, data_url });
+            } catch (err) {
+                console.error('Error saving data to the database:', err);
+                res.status(500).send('Error saving data to the database');
+            }
+        }
+    });
+});
+
+router.post('/verify', async (req, res) => {
+    const email = req.body.email;
+    const userEnteredCode = req.body.code;
+
+    try {
+        if (!email || !userEnteredCode) {
+            return res.status(400).send('Email and code are required.');
+        }
+
+        const user = await getUserByEmail(email);
+
+        if (!user) {
+            return res.status(404).send('User not found');
+        }
+
+        const twofaData = user.twofa_data ? JSON.parse(user.twofa_data) : null;
+
+        if (!twofaData || !twofaData.userSecretKey) {
+            return res.status(500).send('User does not have a secret key');
+        }
+
+        const verified = speakeasy.totp.verify({
+            secret: twofaData.userSecretKey,
+            // encoding: 'base32',
+            token: userEnteredCode,
+            // window: 1,
+        });
+
+        if (verified) {
+            const issuer = twofaData.issuer;
+
+            res.send(`Authentication successful for ${issuer}`);
+        } else {
+            res.status(401).send('Authentication failed');
+        }
+    } catch (error) {
+        console.error('Error verifying the user:', error);
+        res.status(500).send('Error verifying the user.');
+    }
+});
+
+module.exports = router;
